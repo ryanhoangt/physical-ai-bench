@@ -38,8 +38,10 @@ dependencies = [
     "qwen-vl-utils[decord]>=0.0.14",
     "vllm>=0.10.1",
     "dreamsim",
+    "peft<0.15.0",
     "openai>=1.0.0",
     "python-dotenv",
+    "litellm>=1.83.10",
 ]
 
 [build-system]

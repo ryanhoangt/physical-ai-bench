@@ -127,7 +127,7 @@ class PBench(object):
                         })
 
                 if len(prompt_list) > 0:
-                    prompt_list = {os.path.join(videos_path, path): prompt_list[path] for path in prompt_list}
+                    prompt_list = {os.path.abspath(path): prompt_list[path] for path in prompt_list}
 
                     if not enable_missing_videos:
                         assert len(prompt_list) >= len(cur_full_info_list), """
