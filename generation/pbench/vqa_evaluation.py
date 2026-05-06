@@ -1,6 +1,7 @@
 import os
 import base64
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 import logging
@@ -12,9 +13,7 @@ from tqdm import tqdm
 from vllm import LLM, SamplingParams
 from transformers import AutoProcessor, AutoTokenizer
 from qwen_vl_utils import process_vision_info
-import requests
-from requests.auth import HTTPBasicAuth
-from openai import OpenAI
+from litellm import completion, completion_cost
 from dotenv import load_dotenv
 
 load_dotenv(verbose=True)
@@ -345,87 +344,28 @@ class QwenVLEvaluator:
             return correct_answer_text in model_answer
 
 
-class OpenAIEvaluator:
-    def __init__(self, model_name="gpt-4o", max_frames_num=8, max_retries=5, timeout=10, max_size_in_mb=20, reasoning_effort="medium"):
-        """Initialize OpenAI-compatible model for VQA evaluation"""
+class LiteLLMEvaluator:
+    def __init__(self, model_name="gpt-4o", max_frames_num=8, max_retries=5, timeout=10, max_size_in_mb=20):
+        """Initialize LiteLLM-based evaluator for VQA evaluation.
+
+        Supports any model string LiteLLM accepts (gpt-4o, anthropic/claude-*, etc.).
+        API keys are read from environment variables by LiteLLM automatically.
+        """
         self.model_name = model_name
         self.max_frames_num = max_frames_num
         self.max_retries = max_retries
         self.timeout = timeout
         self.max_size_in_mb = max_size_in_mb
-        self.reasoning_effort = reasoning_effort
-        self.use_auth_api = model_name.endswith("-auth")
-
-        if self.use_auth_api:
-            self.base_model_name = model_name[:-5]
-        else:
-            self.base_model_name = model_name
-
-        self.client = None
-
-    def get_client_api_key(self, api_service: str) -> str:
-        """Request a new API access token from authentication server"""
-        client_id = os.getenv("AUTH_SERVER_CLIENT_ID")
-        client_secret = os.getenv("AUTH_SERVER_CLIENT_SECRET")
-        url = os.getenv("AUTH_SERVER_TOKEN_URL")
-
-        if not all([client_id, client_secret, url]):
-            raise ValueError("AUTH_SERVER_CLIENT_ID, AUTH_SERVER_CLIENT_SECRET, and AUTH_SERVER_TOKEN_URL must be set")
-
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        scope_map = {"oai": "azureopenai-readwrite"}
-        data = {"grant_type": "client_credentials", "scope": scope_map[api_service]}
-
-        response = requests.post(url, headers=headers, data=data, auth=HTTPBasicAuth(client_id, client_secret))
-        if response.status_code != 200:
-            raise RuntimeError("Error: Could not generate a Bearer API token, please try again")
-
-        return response.json()["access_token"]
-
-    def refresh_token_and_client(self):
-        """Refresh the API token and recreate the client"""
-        if not self.use_auth_api:
-            logger.warning("Token refresh requested but use_auth_api is False")
-            return
-
-        logger.info("Refreshing API token...")
-        api_key = self.get_client_api_key("oai")
-        base_url = os.getenv("OPENAI_API_BASE")
-
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            default_headers={"dataClassification": "sensitive", "dataSource": "internet"}
-        )
-        logger.info("API token refreshed successfully")
+        self.total_cost = 0.0
+        self._cost_lock = threading.Lock()
 
     def load_model(self):
-        """Initialize the OpenAI client"""
-        logger.info(f"Initializing OpenAI client for model: {self.base_model_name}")
-
-        if self.use_auth_api:
-            api_key = self.get_client_api_key("oai")
-            base_url = os.getenv("OPENAI_API_BASE")
-            self.client = OpenAI(
-                api_key=api_key,
-                base_url=base_url,
-                default_headers={"dataClassification": "sensitive", "dataSource": "internet"}
-            )
-        else:
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                raise ValueError("OPENAI_API_KEY must be set for standard models")
-            self.client = OpenAI(api_key=api_key)
-
-        logger.info(f"Successfully initialized client for: {self.base_model_name}")
+        logger.info(f"Using LiteLLM evaluator for model: {self.model_name}")
 
     def encode_image(self, image):
-        """Encode image to base64 string"""
+        """Encode image to base64 PNG, resizing if over max_size_in_mb."""
         max_size = self.max_size_in_mb * 1024 * 1024
-        if isinstance(image, str):
-            img = Image.open(image).convert("RGB")
-        else:
-            img = image.copy()
+        img = Image.open(image).convert("RGB") if isinstance(image, str) else image.copy()
 
         output_buffer = BytesIO()
         img.save(output_buffer, format="PNG")
@@ -434,16 +374,14 @@ class OpenAIEvaluator:
         while len(byte_data) > max_size and img.size[0] > 100 and img.size[1] > 100:
             new_size = (int(img.size[0] * 0.75), int(img.size[1] * 0.75))
             img = img.resize(new_size, Image.Resampling.LANCZOS)
-
             output_buffer = BytesIO()
             img.save(output_buffer, format="PNG")
             byte_data = output_buffer.getvalue()
 
-        base64_str = base64.b64encode(byte_data).decode("utf-8")
-        return base64_str
+        return base64.b64encode(byte_data).decode("utf-8")
 
     def encode_video(self, video_path, max_num_frames):
-        """Encode video frames to base64 strings using qwen_vl_utils"""
+        """Extract video frames and encode them as base64 PNG strings."""
         if max_num_frames == 0:
             return []
 
@@ -458,51 +396,34 @@ class OpenAIEvaluator:
         nframes = max(min(max_num_frames, total_frame_num), 2)
 
         video_element = {"type": "video", "video": video_path, "nframes": nframes}
-        message = [{"role": "user", "content": [video_element]}]
-        _, video_inputs = process_vision_info([message])
+        _, video_inputs = process_vision_info([{"role": "user", "content": [video_element]}])
 
         if video_inputs is None or len(video_inputs) == 0:
             return []
 
         video_tensor = video_inputs[0]
-        actual_nframes = len(video_tensor)
-
         if max_num_frames == 1:
-            video_tensor = video_inputs[0][:1]
-            actual_nframes = 1
+            video_tensor = video_tensor[:1]
 
         base64_frames = []
-        for idx in range(actual_nframes):
-            if hasattr(video_tensor, "numpy"):
-                frame = video_tensor[idx].numpy()
-            elif hasattr(video_tensor[idx], "numpy"):
-                frame = video_tensor[idx].numpy()
-            else:
-                frame = video_tensor[idx]
-
+        for idx in range(len(video_tensor)):
+            frame = video_tensor[idx]
+            if hasattr(frame, "numpy"):
+                frame = frame.numpy()
             if frame.shape[-1] != 3 and frame.shape[0] == 3:
                 frame = np.transpose(frame, (1, 2, 0))
-
             if frame.dtype != np.uint8:
-                if frame.max() <= 1.0:
-                    frame = (frame * 255).astype(np.uint8)
-                else:
-                    frame = frame.astype(np.uint8)
+                frame = (frame * 255).astype(np.uint8) if frame.max() <= 1.0 else frame.astype(np.uint8)
 
             img = Image.fromarray(frame)
-            output_buffer = BytesIO()
-            img.save(output_buffer, format="PNG")
-            byte_data = output_buffer.getvalue()
-            base64_str = base64.b64encode(byte_data).decode("utf-8")
-            base64_frames.append(base64_str)
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            base64_frames.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
 
         return base64_frames
 
     def answer_questions_batch(self, video_path, qa_data, batch_size=16):
-        """Answer all questions for a video using OpenAI API with threading"""
-        if self.client is None:
-            self.load_model()
-
+        """Answer all questions for a video via LiteLLM with parallel threading."""
         if not qa_data:
             return []
 
@@ -515,94 +436,74 @@ class OpenAIEvaluator:
             return ["" for _ in qa_data]
 
         def process_single_question(qa, idx):
-            """Process a single question with retries"""
             question_prompt = user_template_binary_v0(qa, is_reasoning=False)
             combined_text_prompt = f"{begin_user_prompt}\n\n{question_prompt}"
 
-            user_content = []
-            for frame in encoded_frames:
-                user_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{frame}"}
-                })
+            user_content = [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{f}"}}
+                for f in encoded_frames
+            ]
             user_content.append({"type": "text", "text": combined_text_prompt})
 
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
+                {"role": "user",   "content": user_content},
             ]
 
             for attempt in range(self.max_retries):
                 try:
-                    api_params = {
-                        "model": self.base_model_name,
-                        "messages": messages,
-                    }
+                    response = completion(
+                        model=self.model_name,
+                        messages=messages,
+                        max_tokens=1024,
+                        temperature=0.0,
+                        base_url=os.environ.get("LITELLM_BASE_URL"),
+                        api_key=os.environ.get("LITELLM_API_KEY"),
+                    )
+                    # cost = completion_cost(completion_response=response)
+                    cost = 0 # TODO: fixme
+                    with self._cost_lock:
+                        self.total_cost += cost
 
-                    if "o1" in self.base_model_name or "o3" in self.base_model_name or "gpt-5" in self.base_model_name:
-                        api_params["max_completion_tokens"] = 1024
-                        if self.reasoning_effort is not None:
-                            api_params["reasoning_effort"] = self.reasoning_effort
-                    else:
-                        api_params["max_tokens"] = 1024
-                        api_params["temperature"] = 0.0
-
-                    response = self.client.chat.completions.create(**api_params)
                     response_text = response.choices[0].message.content
-
-                    logger.info(f"[OpenAI VQA] Question: {qa['question']}")
-                    logger.info(f"[OpenAI VQA] Correct Answer: {qa['index2ans'][qa['answer']]}")
-                    logger.info(f"[OpenAI VQA] Model Response: {response_text}")
-
+                    logger.info(f"[LiteLLM VQA] Q: {qa['question']}")
+                    logger.info(f"[LiteLLM VQA] Correct: {qa['index2ans'][qa['answer']]}")
+                    logger.info(f"[LiteLLM VQA] Response: {response_text}  cost=${cost:.5f}")
                     return response_text, idx
 
                 except Exception as e:
                     error_msg = str(e)
                     logger.info(f"Question {idx} attempt {attempt + 1}/{self.max_retries} failed: {error_msg}")
-
-                    if "content_filter" in error_msg.lower() or "responsibleaipolicyviolation" in error_msg.lower():
-                        logger.warning(f"Question {idx} filtered by content policy, skipping retries")
-                        return "[CONTENT_FILTERED]", idx
-
-                    if "401" in error_msg and "token has expired" in error_msg.lower():
-                        logger.info("Token expired, refreshing token and retrying...")
-                        try:
-                            self.refresh_token_and_client()
-                            continue
-                        except Exception as refresh_error:
-                            logger.error(f"Failed to refresh token: {refresh_error}")
-
                     if attempt == self.max_retries - 1:
                         logger.error(f"All {self.max_retries} attempts failed for question {idx}")
                         return "", idx
-                    else:
-                        time.sleep(self.timeout)
+                    time.sleep(self.timeout)
 
             return "", idx
 
         all_responses = [""] * len(qa_data)
-
         max_workers = min(len(qa_data), 32)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
                 executor.submit(process_single_question, qa, i): i
                 for i, qa in enumerate(qa_data)
             }
-
-            for future in tqdm(as_completed(future_to_idx), total=len(qa_data),
-                             desc=f"Processing questions for {os.path.basename(video_path)}",
-                             disable=get_rank() > 0):
+            for future in tqdm(
+                as_completed(future_to_idx),
+                total=len(qa_data),
+                desc=f"Processing questions for {os.path.basename(video_path)}",
+                disable=get_rank() > 0,
+            ):
                 response_text, idx = future.result()
                 all_responses[idx] = response_text
 
         return all_responses
 
     def evaluate_video_qa(self, video_path, qa_data):
-        """Evaluate all questions for a single video"""
+        """Evaluate all questions for a single video."""
         if not os.path.exists(video_path):
             logger.warning(f"Video file not found: {video_path}")
             return []
-
         if not qa_data:
             return []
 
@@ -610,72 +511,50 @@ class OpenAIEvaluator:
 
         results = []
         for i, qa in enumerate(qa_data):
-            question = qa['question']
-            correct_answer = qa['answer']
-            model_answer = model_answers[i]
-
-            is_correct = self.check_answer_accuracy(model_answer, correct_answer, qa['index2ans'])
-
-            result = {
+            is_correct = self.check_answer_accuracy(model_answers[i], qa['answer'], qa['index2ans'])
+            results.append({
                 'uid': qa['uid'],
-                'question': question,
-                'correct_answer': correct_answer,
-                'model_answer': model_answer,
+                'question': qa['question'],
+                'correct_answer': qa['answer'],
+                'model_answer': model_answers[i],
                 'is_correct': is_correct,
-                'task': qa['task']
-            }
-            results.append(result)
-
+                'task': qa['task'],
+            })
         return results
 
     def aggregate_multi_seed_results(self, all_seed_results):
-        """Aggregate results from multiple seeds using majority vote and average accuracy"""
+        """Aggregate results across seeds using average accuracy."""
         question_groups = {}
         for result in all_seed_results:
-            uid = result['uid']
-            if uid not in question_groups:
-                question_groups[uid] = []
-            question_groups[uid].append(result)
+            question_groups.setdefault(result['uid'], []).append(result)
 
         aggregated_results = []
         for uid, seed_results in question_groups.items():
             if not seed_results:
                 continue
-
             template = seed_results[0]
-
             correct_count = sum(1 for r in seed_results if r['is_correct'])
             total_seeds = len(seed_results)
-            accuracy = correct_count / total_seeds if total_seeds > 0 else 0.0
-
-            all_answers = [r['model_answer'] for r in seed_results]
-
-            aggregated_result = {
+            aggregated_results.append({
                 'uid': uid,
                 'question': template['question'],
                 'correct_answer': template['correct_answer'],
-                'model_answers': all_answers,
-                'accuracy': accuracy,
+                'model_answers': [r['model_answer'] for r in seed_results],
+                'accuracy': correct_count / total_seeds if total_seeds > 0 else 0.0,
                 'total_seeds': total_seeds,
-                'task': template['task']
-            }
-
-            aggregated_results.append(aggregated_result)
-
+                'task': template['task'],
+            })
         return aggregated_results
 
     def check_answer_accuracy(self, model_answer, correct_answer, index2ans):
-        """Check if model answer is correct"""
+        """Check binary yes/no answer accuracy."""
         model_answer = model_answer.lower().strip()
-
         correct_answer_text = index2ans[correct_answer].lower()
-
         if correct_answer_text == "yes":
             return "yes" in model_answer and "no" not in model_answer
         elif correct_answer_text == "no":
             return "no" in model_answer and "yes" not in model_answer
-        else:
-            return correct_answer_text in model_answer
+        return correct_answer_text in model_answer
 
 
 def find_all_video_files(video_id, video_dir):
@@ -740,23 +619,22 @@ def compute_vqa_accuracy(
     prompt_data = load_json(prompt_file)
     video_id_set = {item['video_id'] for item in prompt_data}
 
-    is_openai_model = any(model_name.startswith(prefix) for prefix in ['gpt-', 'o1-', 'o3-'])
+    # Local vLLM models (HuggingFace paths) use QwenVLEvaluator; everything else uses LiteLLM
+    use_vllm = "/" in model_name and model_name.startswith(("Qwen/", "meta-llama/", "mistralai/"))
 
-    if is_openai_model:
-        logger.info(f"Using OpenAI-compatible evaluator for model: {model_name}")
-        reasoning_effort = kwargs.get('reasoning_effort', 'medium')
-        evaluator = OpenAIEvaluator(model_name=model_name, reasoning_effort=reasoning_effort)
-        evaluator.load_model()
-    else:
+    if use_vllm:
         logger.info(f"Using Qwen vLLM evaluator for model: {model_name}")
         evaluator = QwenVLEvaluator(model_name=model_name, device=device, tensor_parallel_size=tensor_parallel_size)
-
         if get_rank() == 0:
             evaluator.load_model()
             barrier()
         else:
             barrier()
             evaluator.load_model()
+    else:
+        logger.info(f"Using LiteLLM evaluator for model: {model_name}")
+        evaluator = LiteLLMEvaluator(model_name=model_name)
+        evaluator.load_model()
 
     # Get all VQA files and map them to video_ids
     vqa_files = [f for f in os.listdir(vqa_questions_dir) if f.endswith('.json')]
@@ -918,6 +796,8 @@ def compute_vqa_accuracy(
     logger.info(f"VQA Evaluation Complete: {correct_count}/{total_count} = {overall_accuracy:.4f}")
     logger.info(f"Total video_ids processed: {len(all_results)}")
     logger.info(f"Total seeds processed: {total_seeds_processed}")
+    if isinstance(evaluator, LiteLLMEvaluator):
+        logger.info(f"Total LiteLLM cost: ${evaluator.total_cost:.4f}")
 
     # Log category scores
     for category, score in category_scores.items():
