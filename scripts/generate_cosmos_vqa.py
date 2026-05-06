@@ -102,8 +102,9 @@ reverse causality.
 RULES:
 1. Create questions that require both the information in the caption and the robot manipulation \
 task with your creativity. Do NOT create any questions with answers that are directly given in the caption.
-2. Select at lease 2 subcategories from each main category (Space, Time, Physics), each can have \
-more than 1 question, totaling from 6-10 questions. Choose the subcategories most naturally applicable to this specific scene and task.
+2. Select at lease 1 subcategory from each main category (Space, Time, Physics). Each subcategory can have \
+more than 1 question, especially those in Time and Space category, totaling from 6-10 questions. \
+Choose the subcategories most naturally applicable to this specific scene and task.
 3. Target ~70% answer "A" (yes) and ~30% answer "B" (no) across all questions.
 4. For "B" answers: write plausible but INCORRECT statements as good distractors.
 5. Scene questions (Relationship, Geometry, Attributes, Environment): ground the answer in \
@@ -121,6 +122,10 @@ Return ONLY a JSON array — no markdown fences, no explanation:
   ...
 ]
 """
+
+
+# Video IDs used as few-shot ICL examples (from the reference benchmark dataset)
+ICL_EXAMPLE_IDS = ["robot_000", "robot_014"]
 
 
 def encode_image(image_path: Path) -> str:
@@ -143,6 +148,56 @@ def build_user_content(image_path: Path, task_prompt: str) -> list:
             "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
         },
     ]
+
+
+def load_icl_examples(repo_root: Path) -> list:
+    """Build few-shot user/assistant message pairs from the reference benchmark dataset.
+
+    Returns a flat list of alternating user/assistant messages ready to be
+    inserted into the messages list between the system prompt and the real request.
+    """
+    ref_dir = repo_root / "datasets" / "physical-ai-bench-generation"
+    full_info_path = ref_dir / "cosmos_predict2_bench_full_info.json"
+
+    if not full_info_path.exists():
+        print("  [WARN] Reference full_info.json not found — skipping ICL examples")
+        return []
+
+    full_info = json.loads(full_info_path.read_text())
+    prompt_map = {entry["video_id"]: entry["prompt_en"] for entry in full_info}
+
+    messages = []
+    for vid_id in ICL_EXAMPLE_IDS:
+        image_path = ref_dir / "condition_image" / f"{vid_id}.jpg"
+        vqa_path   = ref_dir / "vqa" / f"{vid_id}.json"
+
+        if not image_path.exists() or not vqa_path.exists():
+            print(f"  [WARN] ICL example {vid_id} missing image or vqa file — skipping")
+            continue
+
+        prompt   = prompt_map.get(vid_id, "")
+        vqa_data = json.loads(vqa_path.read_text())
+
+        # Convert benchmark VQA format → LLM output format (category + question + answer)
+        llm_output = [
+            {
+                "category": entry["uid"].split("_(")[1].rstrip(")"),
+                "question": entry["question"],
+                "answer":   entry["answer"],
+            }
+            for entry in vqa_data
+        ]
+
+        messages.append({
+            "role":    "user",
+            "content": build_user_content(image_path, prompt),
+        })
+        messages.append({
+            "role":    "assistant",
+            "content": json.dumps(llm_output, indent=2),
+        })
+
+    return messages
 
 
 def parse_llm_response(text: str) -> list:
@@ -194,13 +249,16 @@ def generate_vqa_for_video(
     task_prompt: str,
     frame_path: Path,
     model: str,
+    icl_messages: list = (),
 ) -> tuple[list, float]:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *icl_messages,
+        {"role": "user", "content": build_user_content(frame_path, task_prompt)},
+    ]
     response = completion(
         model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_content(frame_path, task_prompt)},
-        ],
+        messages=messages,
         temperature=0.3,
         base_url=os.environ.get("LITELLM_BASE_URL"),
         api_key=os.environ.get("LITELLM_API_KEY")
@@ -269,9 +327,11 @@ def main():
     if args.n_videos:
         full_info = full_info[: args.n_videos]
 
+    icl_messages = load_icl_examples(repo_root)
     print(f"Subset     : {args.subset}")
     print(f"Model      : {args.model}")
     print(f"Videos     : {len(full_info)}")
+    print(f"ICL shots  : {len(icl_messages) // 2}")
     print(f"Output dir : {vqa_dir}")
     print()
 
@@ -299,7 +359,7 @@ def main():
             continue
 
         try:
-            entries, cost = generate_vqa_for_video(video_id, f"{prompt}\nTask: {task_name}", frame_path, args.model)
+            entries, cost = generate_vqa_for_video(video_id, f"{prompt}\nTask: {task_name}", frame_path, args.model, icl_messages)
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(entries, f, indent=4, ensure_ascii=False)
             total_cost += cost
