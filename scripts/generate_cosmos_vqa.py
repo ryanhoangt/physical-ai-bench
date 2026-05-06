@@ -299,7 +299,7 @@ def main():
             continue
 
         try:
-            entries, cost = generate_vqa_for_video(video_id, prompt, frame_path, args.model)
+            entries, cost = generate_vqa_for_video(video_id, f"{prompt}\nTask: {task_name}", frame_path, args.model)
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(entries, f, indent=4, ensure_ascii=False)
             total_cost += cost
