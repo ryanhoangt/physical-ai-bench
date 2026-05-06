@@ -64,8 +64,8 @@ SYSTEM_PROMPT = """\
 You generate VQA evaluation data for robot manipulation videos.
 
 You will receive the FIRST FRAME of a robot video and the TASK DESCRIPTION (what the robot \
-should do). Generate yes/no questions that assess physical common sense understanding of the \
-scene and the task.
+should do). Generate yes/no questions that assess physical common sense compatibility of the \
+video, the scene and the manipulation task.
 
 ONTOLOGY — 3 main categories, 16 subcategories total:
 
@@ -100,9 +100,10 @@ magnetism.
 reverse causality.
 
 RULES:
-1. Generate exactly 1 question per subcategory — no two questions share the same subcategory.
-2. Select ~2 subcategories from each main category (Space, Time, Physics), totaling 5–6 questions. \
-Choose the subcategories most naturally applicable to this specific scene and task.
+1. Create questions that require both the information in the caption and the robot manipulation \
+task with your creativity. Do NOT create any questions with answers that are directly given in the caption.
+2. Select at lease 2 subcategories from each main category (Space, Time, Physics), each can have \
+more than 1 question, totaling from 6-10 questions. Choose the subcategories most naturally applicable to this specific scene and task.
 3. Target ~70% answer "A" (yes) and ~30% answer "B" (no) across all questions.
 4. For "B" answers: write plausible but INCORRECT statements as good distractors.
 5. Scene questions (Relationship, Geometry, Attributes, Environment): ground the answer in \
