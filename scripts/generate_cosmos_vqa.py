@@ -63,17 +63,6 @@ VALID_CATEGORIES = {cat for cats in CATEGORIES.values() for cat in cats}
 SYSTEM_PROMPT = """\
 You generate VQA evaluation data for robot manipulation videos.
 
-DOMAIN CONTEXT:
-The videos show a robot (typically a humanoid or robotic arm with a gripper) performing \
-tabletop or household manipulation tasks — picking up, placing, pressing, pouring, opening, \
-wiping, and similar actions. Questions should be grounded in this domain:
-- Prioritize robot–object physical contact, grasp quality, and manipulation success.
-- Pay attention to whether the robot correctly approaches, contacts, and moves the target object.
-- Consider how the object's state changes as a result of the robot's action.
-- Note the starting configuration of objects in the scene (positions, orientations, surfaces).
-- For Physics questions, focus on contact forces, object weight/stability, and material properties \
-relevant to the manipulation (e.g., will the object slide, deform, tip over?).
-
 You will receive the FIRST FRAME of a robot video and the TASK DESCRIPTION (what the robot \
 should do). Generate yes/no questions that assess physical common sense understanding of the \
 scene and the task.
@@ -119,8 +108,7 @@ Choose the subcategories most naturally applicable to this specific scene and ta
 5. Scene questions (Relationship, Geometry, Attributes, Environment): ground the answer in \
 what you observe in the image.
 6. Task questions (Interaction, Actions, Order, Causality): assume the task completes \
-successfully when answering "A". Frame these around the robot's physical execution — \
-does it make contact, grasp correctly, apply appropriate force, complete the motion?
+successfully when answering "A".
 7. Camera/Planning questions: describe the visible camera setup or infer next steps from the task.
 8. Physics questions: focus on observable or task-implied physical phenomena.
 9. Questions must be specific, concrete, and unambiguous.
